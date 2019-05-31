@@ -1,0 +1,369 @@
+#!/bin/bash
+#
+# Copyright (C) - 2019 Gabriel-Andrew Pollo-Guilbert <gabriel.pollo-guilbert@efficios.com>
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License, version 2 only, as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc., 51
+# Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# WARNING: This test must be run with as a root. It adds a new user to the
+#          machine, changes their groups and then proceed to starts a global
+#          session daemon that record traces. It does not do any cleanup.
+
+TRACING_GROUP="tracing"
+TEST_USER1=test_destructive_setuid_user1
+TEST_USER2=test_destructive_setuid_user2
+ROOT_USER=root
+
+TEST_PROGRAM=./change_user
+
+SESSION_NAME=test-session
+CHANNEL_NAME=test-channel
+
+LIB_LTTNG_UST_SETUID=liblttng-ust-setuid.so
+LIB_LTTNG_UST_SETUID_PATH=$(ldconfig -p | grep $LIB_LTTNG_UST_SETUID | tail -n1 | sed 's/.*=> \(.*\)/\1/g')
+
+TP_BEFORE="setuid_wrapper:before"
+TP_AFTER="setuid_wrapper:after"
+
+TESTDIR=$(dirname "$0")/../..
+TESTCOUNT=488
+TESTDESC="Wrappers for setuid() system call family"
+
+source "$TESTDIR"/utils/utils.sh
+plan_tests $TESTCOUNT
+print_test_banner "$TESTDESC"
+
+function assert_eq()
+{
+	local msg=$1
+	local expected=$2
+	local got=$3
+
+	if [[ ! "$expected" == "$got" ]]; then
+		fail "$msg: expected=$expected, got=$got"
+	else
+		pass "$msg"
+	fi
+}
+
+function assert_tracepoint_in()
+{
+	local trace_dir=$1
+	local username=$2
+	local tracepoint=$3
+	local uid_expected
+	local uid_field
+	local msg
+	local trace_dir_uid
+	local event_count
+
+	uid_expected=$(id -u "$username")
+	msg="$tracepoint tracepoint should be in $username's ($uid_expected) trace"
+	trace_dir_uid="$trace_dir/ust/uid/$uid_expected/"
+	event_count=$(babeltrace "$trace_dir_uid" | grep -c "$tracepoint")
+
+	if [[ ! $event_count -eq 1 ]]; then
+		fail "$msg"
+	fi
+
+	uid_field=$(babeltrace "$trace_dir_uid" | grep "$tracepoint" | sed 's/.*{ uid = \(.*\) }.*/\1/g')
+	if [[ ! "$uid_field" == "$uid_expected" ]]; then
+		fail "$msg (UID mismatch)"
+	fi
+
+	pass "$msg"
+}
+
+function assert_before()
+{
+	local trace_dir=$1
+	local username=$2
+
+	assert_tracepoint_in "$trace_dir" "$username" $TP_BEFORE
+}
+
+function assert_after()
+{
+	local trace_dir=$1
+	local username=$2
+
+	assert_tracepoint_in "$trace_dir" "$username" $TP_AFTER
+}
+
+function check_if_user_exists()
+{
+	local username=$1
+
+	if id -u "$username" 2> /dev/null > /dev/null; then
+		echo "Unexpected system state. The $username shouldn't exist on the system."
+		exit 0
+	fi
+}
+
+function check_system_state()
+{
+	check_if_user_exists $TEST_USER1
+	check_if_user_exists $TEST_USER2
+}
+
+function setup_capabilities()
+{
+	local lib_path
+	local lib_dir
+
+	lib_path=$(readlink -f "$LIB_LTTNG_UST_SETUID_PATH")
+	lib_dir=$(dirname "$lib_path")
+
+	if ! find "$lib_dir" -perm -4000 | grep "$lib_path" > /dev/null; then
+		chmod +s "$lib_path"
+		REMOVE_SUID_BIT=1
+	else
+		REMOVE_SUID_BIT=0
+	fi
+
+	setcap CAP_SETUID+ep $TEST_PROGRAM
+}
+
+function cleanup_capabilities()
+{
+	local lib_path
+
+	lib_path=$(readlink -f "$LIB_LTTNG_UST_SETUID_PATH")
+	if [[ $REMOVE_SUID_BIT == 1 ]]; then
+		chmod -s "$lib_path"
+	fi
+
+	setcap CAP_SETUID-ep $TEST_PROGRAM
+}
+
+function setup_tracing_group()
+{
+	if ! grep -q $TRACING_GROUP /etc/group; then
+		groupadd $TRACING_GROUP
+		REMOVE_TRACING_GROUP=1
+	else
+		REMOVE_TRACING_GROUP=0
+	fi
+}
+
+function cleanup_tracing_group()
+{
+
+	if [[ $REMOVE_TRACING_GROUP -eq 1 ]]; then
+		groupdel $TRACING_GROUP
+	fi
+}
+
+function setup_users()
+{
+	useradd --no-user-group --no-create-home $TEST_USER1 -G $TRACING_GROUP
+	useradd --no-user-group --no-create-home $TEST_USER2 -G $TRACING_GROUP
+}
+
+function cleanup_users()
+{
+	userdel $TEST_USER1
+	userdel $TEST_USER2
+}
+
+function start_tracing_session()
+{
+	local trace_path=$1
+
+	create_lttng_session_ok $SESSION_NAME "$trace_path"
+	enable_ust_lttng_channel_ok $SESSION_NAME $CHANNEL_NAME "$BUFFERS_TYPE_ARG"
+	enable_ust_lttng_event_ok $SESSION_NAME $TP_BEFORE $CHANNEL_NAME
+	enable_ust_lttng_event_ok $SESSION_NAME $TP_AFTER $CHANNEL_NAME
+	start_lttng_tracing_ok $SESSION_NAME
+}
+
+function test_program()
+{
+	local command=$1
+	local expected_user_before=$2
+	local expected_user_after=$3
+	local args=${*:4}
+	local uid_before
+	local trace_dir
+	local trace_count
+	local msg
+
+	if [[ $BUFFERS_TYPE_ARG == "--buffers-pid" ]]; then
+		expected_user_after="$expected_user_before"
+	fi;
+
+	uid_before=$(id -u "$expected_user_before")
+	diag "Test $command($args) as $expected_user_before ($uid_before)"
+
+	trace_dir=$(mktemp -d)
+	start_tracing_session "$trace_dir"
+
+	su "$expected_user_before" -c "LD_PRELOAD=$LIB_LTTNG_UST_SETUID $TEST_PROGRAM $command $args"
+
+	trace_count=$(find "$trace_dir" -maxdepth 3 -mindepth 3 | wc -l)
+	if [[ "$expected_user_before" == "$expected_user_after" ]]; then
+		msg="$command($args) as $expected_user_before ($uid_before) should generate one trace"
+		assert_eq "$msg" 1 "$trace_count"
+	else
+		msg="$command($args) as $expected_user_before ($uid_before) should generate two traces"
+		assert_eq "$msg" 2 "$trace_count"
+	fi
+
+	stop_lttng_tracing_ok $SESSION_NAME
+
+	if [[ $BUFFERS_TYPE_ARG == "--buffers-uid" ]]; then
+		assert_before "$trace_dir" "$expected_user_before"
+		assert_after "$trace_dir" "$expected_user_after"
+	fi;
+
+	destroy_lttng_session_ok $SESSION_NAME
+}
+
+function test_setuid()
+{
+	local expected_user_before=$1
+	local expected_user_after=$2
+	local arg_uid
+
+	arg_uid=$(id -u "$2")
+	test_program setuid "$expected_user_before" "$expected_user_after" "$arg_uid"
+}
+
+function test_seteuid()
+{
+	local expected_user_before=$1
+	local expected_user_after=$expected_user_before
+	local arg_euid
+
+	arg_euid=$(id -u "$2")
+	test_program seteuid "$expected_user_before" "$expected_user_after" "$arg_euid"
+}
+
+function test_setreuid()
+{
+	local expected_user_before=$1
+	local expected_user_after=$2
+	local arg_ruid
+	local arg_euid
+
+	arg_ruid=$(id -u "$2")
+	arg_euid=$(id -u "$3")
+	test_program setreuid "$expected_user_before" "$expected_user_after" "$arg_ruid $arg_euid"
+}
+
+function test_setresuid()
+{
+	local expected_user_before=$1
+	local expected_user_after=$2
+	local arg_ruid
+	local arg_euid
+	local arg_suid
+
+	arg_ruid=$(id -u "$2")
+	arg_euid=$(id -u "$3")
+	arg_suid=$(id -u "$4")
+	test_program setresuid "$expected_user_before" "$expected_user_after" "$arg_ruid" "$arg_euid" "$arg_suid"
+}
+
+function setup_test_bench()
+{
+	setup_capabilities
+	setup_tracing_group
+	setup_users
+	start_lttng_sessiond
+
+	function sigint_handler()
+	{
+		teardown_test_bench
+		full_cleanup
+		exit
+	}
+
+	trap sigint_handler INT
+}
+
+function run_tests()
+{
+	# setuid() tests
+	test_setuid $TEST_USER1 "$TEST_USER1"
+	test_setuid $TEST_USER1 "$TEST_USER2"
+	test_setuid $TEST_USER1 "$ROOT_USER"
+
+	test_setuid $ROOT_USER $TEST_USER1
+	test_setuid $ROOT_USER $TEST_USER2
+	test_setuid $ROOT_USER $ROOT_USER
+
+	# seteuid() tests
+	test_seteuid $TEST_USER1 $TEST_USER1
+	test_seteuid $TEST_USER1 $TEST_USER2
+	test_seteuid $TEST_USER1 $ROOT_USER
+
+	test_seteuid $ROOT_USER $TEST_USER1
+	test_seteuid $ROOT_USER $TEST_USER2
+	test_seteuid $ROOT_USER $ROOT_USER
+
+	# setreuid() tests
+	test_setreuid $TEST_USER1 $TEST_USER1 $TEST_USER1
+	test_setreuid $TEST_USER1 $TEST_USER2 $TEST_USER2
+	test_setreuid $TEST_USER1 $ROOT_USER $ROOT_USER
+
+	test_setreuid $ROOT_USER $TEST_USER1 $TEST_USER1
+	test_setreuid $ROOT_USER $TEST_USER2 $TEST_USER2
+	test_setreuid $ROOT_USER $ROOT_USER $ROOT_USER
+
+	# setresuid() tests
+	test_setresuid $TEST_USER1 $TEST_USER1 $TEST_USER1 $TEST_USER1
+	test_setresuid $TEST_USER1 $TEST_USER1 $TEST_USER1 $TEST_USER2
+	test_setresuid $TEST_USER1 $TEST_USER1 $TEST_USER1 $ROOT_USER
+
+	test_setresuid $TEST_USER1 $TEST_USER2 $TEST_USER2 $TEST_USER1
+	test_setresuid $TEST_USER1 $TEST_USER2 $TEST_USER2 $TEST_USER2
+	test_setresuid $TEST_USER1 $TEST_USER2 $TEST_USER2 $ROOT_USER
+
+	test_setresuid $TEST_USER1 $ROOT_USER $ROOT_USER $TEST_USER1
+	test_setresuid $TEST_USER1 $ROOT_USER $ROOT_USER $TEST_USER2
+	test_setresuid $TEST_USER1 $ROOT_USER $ROOT_USER $ROOT_USER
+}
+
+function teardown_test_bench()
+{
+	stop_lttng_sessiond
+	cleanup_users
+	cleanup_tracing_group
+	cleanup_capabilities
+}
+
+if [ "$(id -u)" == "0" ]; then
+	IS_ROOT=1
+else
+	IS_ROOT=0
+fi
+
+if ! destructive_tests_enabled ; then
+	echo "You need to set the LTTNG_ENABLE_DESTRUCTIVE_TESTS to \"will-break-my-system\" as argument to run this test"
+	exit 0
+fi
+
+skip $IS_ROOT "Root access is needed. Skipping all tests." $TESTCOUNT ||
+{
+	check_system_state
+	setup_test_bench
+
+	BUFFERS_TYPE_ARG="--buffers-uid"
+	run_tests
+
+	BUFFERS_TYPE_ARG="--buffers-pid"
+	run_tests
+
+	teardown_test_bench
+}

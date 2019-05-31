@@ -88,6 +88,7 @@ gen-events-time
 gen-events
 gen-ust-events
 health_check
+/tests/destructive/setuid-wrapper/change_user
 /tests/regression/kernel/select_poll_epoll
 /tests/regression/tools/mi/extract_xml
 /tests/regression/tools/mi/validate_xml

@@ -1,3 +1,8 @@
+if HAVE_LIBLTTNG_UST_CTL
+SUBDIRS = setuid-wrapper
+DIST_SUBDIRS = setuid-wrapper
+endif
+
 noinst_SCRIPTS = metadata-regeneration
 EXTRA_DIST = metadata-regeneration
 
