@@ -29,6 +29,7 @@
 #include <urcu/compiler.h>
 #include <lttng/ust-error.h>
 #include <signal.h>
+#include <time.h>
 
 #include <common/common.h>
 #include <common/sessiond-comm/sessiond-comm.h>
@@ -1831,15 +1832,18 @@ static void shadow_copy_channel(struct ust_app_channel *ua_chan,
 static void shadow_copy_session(struct ust_app_session *ua_sess,
 		struct ltt_ust_session *usess, struct ust_app *app)
 {
-	time_t rawtime;
 	struct tm *timeinfo;
 	char datetime[16];
 	int ret;
 	char tmp_shm_path[PATH_MAX];
+	struct timespec ts;
 
 	/* Get date and time for unique app path */
-	time(&rawtime);
-	timeinfo = localtime(&rawtime);
+	if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) <0) {
+		PERROR("clock_gettime");
+	}
+
+	timeinfo = localtime(&ts.tv_sec);
 	strftime(datetime, sizeof(datetime), "%Y%m%d-%H%M%S", timeinfo);
 
 	DBG2("Shadow copy of session handle %d", ua_sess->handle);
@@ -1865,8 +1869,8 @@ static void shadow_copy_session(struct ust_app_session *ua_sess,
 	switch (ua_sess->buffer_type) {
 	case LTTNG_BUFFER_PER_PID:
 		ret = snprintf(ua_sess->path, sizeof(ua_sess->path),
-				DEFAULT_UST_TRACE_PID_PATH "/%s-%d-%s", app->name, app->pid,
-				datetime);
+				DEFAULT_UST_TRACE_PID_PATH "/%s-%d-%s.%ld", app->name, app->pid,
+				datetime, ts.tv_nsec);
 		break;
 	case LTTNG_BUFFER_PER_UID:
 		ret = snprintf(ua_sess->path, sizeof(ua_sess->path),
